@@ -7,18 +7,21 @@ use std::process;
 use std::{fs, io::Write, net::SocketAddr};
 use tokio::net::TcpListener;
 use tracing_subscriber;
+use sodiumoxide::randombytes::randombytes;
 
 mod ciphersuite;
 mod handlers;
 mod models;
 mod storage;
+mod websocket;
 
 use crate::storage::Database;
-use crate::handlers::OpaqueServerState;
+use crate::models::OpaqueServerState;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
+    pub opaque_server_setup: ciphersuite::ServerSetup,
     pub opaque_state: OpaqueServerState,
     pub server_pepper: String,
 }
@@ -38,12 +41,13 @@ impl FromRef<AppState> for OpaqueServerState {
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
     // Инициализация логгера
     tracing_subscriber::fmt::init();
     println!("Hello from Skyeslammer Foundation!");
 
     // Проверяем настройку БД и секретов
-    if !storage::is_configured() {
+    if !Database::is_configured() {
         println!("It seems that server is not configured.");
         if let Err(e) = setup().await {
             eprintln!("| DSE | Could not set up the server. Reason: {}", e);
@@ -54,7 +58,7 @@ async fn main() {
     }
 
     // Подключаемся к БД
-    let db = match Database::connect().await {
+    let db = match Database::new(&std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://user:password@localhost/diam".into())).await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("| DSE | Could not connect to database. Reason: {}", e);
@@ -95,10 +99,12 @@ async fn main() {
         .route("/api/register/finish", post(handlers::register_finish))
         .route("/api/login/start", post(handlers::login_start))
         .route("/api/login/finish", post(handlers::login_finish))
+        .route("/ws", get(websocket::websocket_handler))
         .route("/health", get(|| async { "OK" }))
         .with_state(AppState {
             db,
-            server_setup,
+            opaque_server_setup: server_setup,
+            opaque_state: OpaqueServerState::new(),
             server_pepper,
         });
 
@@ -135,9 +141,9 @@ async fn setup() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Генерация OPAQUE Server Setup
     println!("\nGenerating OPAQUE server setup...");
-    let cs = ciphersuite::DefaultCipherSuite::new();
-    let server_setup = opaque_ke::ServerSetup::<ciphersuite::DefaultCipherSuite>::new(&rand::thread_rng());
-    let server_setup_hex = hex::encode(bincode::serialize(&server_setup)?);
+    let server_setup = ciphersuite::DefaultCipherSuite::generate_server_setup();
+    let server_setup_bytes = server_setup.serialize().to_vec();
+    let server_setup_hex = hex::encode(server_setup_bytes);
 
     // 3. Генерация серверного перца
     let server_pepper = generate_pepper();
@@ -156,7 +162,7 @@ async fn setup() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Создание таблиц в БД
     println!("\nCreating database tables...");
-    if let Err(e) = create_database_tables(&db_url).await {
+    if let Err(e) = Database::new(&db_url).await {
         eprintln!("| DSE | Failed to create tables: {}", e);
     } else {
         println!("| DSI | Database tables created successfully.");
@@ -186,14 +192,6 @@ fn ask_password(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
 
 /// Генерация серверного перца
 fn generate_pepper() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let pepper: [u8; 32] = rng.gen();
+    let pepper = randombytes(32); // 32 байт = 256 бит
     hex::encode(pepper)
-}
-
-pub fn is_configured() -> bool {
-    env::var("DATABASE_URL").is_ok()
-        && env::var("OPAQUE_SERVER_SETUP").is_ok()
-        && env::var("SERVER_PEPPER").is_ok()
 }

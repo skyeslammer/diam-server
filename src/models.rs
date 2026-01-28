@@ -1,5 +1,82 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+use std::sync::Arc;
+
+// ============ OPAQUE SERVER STATE ============
+
+#[derive(Clone)]
+pub struct OpaqueServerState {
+    // Хранилище состояния регистрации: registration_id -> ServerRegistration
+    pub registration_states: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    // Хранилище состояния логина: session_id -> ServerLogin
+    pub login_states: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+}
+
+impl OpaqueServerState {
+    pub fn new() -> Self {
+        Self {
+            registration_states: Arc::new(RwLock::new(HashMap::new())),
+            login_states: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn save_registration_state(&self, id: &str, state: Vec<u8>) {
+        let mut states = self.registration_states.write().await;
+        states.insert(id.to_string(), state);
+    }
+
+    pub async fn get_registration_state(&self, id: &str) -> Option<Vec<u8>> {
+        let states = self.registration_states.read().await;
+        states.get(id).cloned()
+    }
+
+    pub async fn remove_registration_state(&self, id: &str) {
+        let mut states = self.registration_states.write().await;
+        states.remove(id);
+    }
+
+    pub async fn save_login_state(&self, id: &str, state: Vec<u8>) {
+        let mut states = self.login_states.write().await;
+        states.insert(id.to_string(), state);
+    }
+
+    pub async fn get_login_state(&self, id: &str) -> Option<Vec<u8>> {
+        let states = self.login_states.read().await;
+        states.get(id).cloned()
+    }
+
+    pub async fn remove_login_state(&self, id: &str) {
+        let mut states = self.login_states.write().await;
+        states.remove(id);
+    }
+}
+
+impl Default for OpaqueServerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============ ТИПЫ ИДЕНТИФИКАТОРОВ ============
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentifierType {
+    Username,
+    Email,
+    Phone,
+}
+
+pub fn get_identifier_type(identifier: &str) -> IdentifierType {
+    if identifier.contains('@') {
+        IdentifierType::Email
+    } else if identifier.starts_with('+') || identifier.len() == 11 && identifier.chars().all(|c| c.is_numeric()) {
+        IdentifierType::Phone
+    } else {
+        IdentifierType::Username
+    }
+}
 
 // ============ ТИПЫ ПОЛЬЗОВАТЕЛЕЙ ============
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -33,48 +110,51 @@ impl From<String> for UserType {
 
 // ============ ЗАПРОСЫ/ОТВЕТЫ ДЛЯ OPAQUE ============
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OpaqueRegisterStartRequest {
     pub identifier: String, // email, phone или username
+    pub registration_request: Vec<u8>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OpaqueRegisterStartResponse {
     pub registration_request: Vec<u8>,
     pub server_public_key: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OpaqueRegisterFinishRequest {
     pub identifier: String,
     pub registration_upload: Vec<u8>,
     pub user_type: Option<UserType>, // По умолчанию Regular
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OpaqueRegisterFinishResponse {
     pub user_id: Uuid,
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OpaqueAuthStartRequest {
     pub identifier: String,
+    pub credential_request: Vec<u8>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OpaqueAuthStartResponse {
     pub credential_request: Vec<u8>,
     pub server_public_key: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OpaqueAuthFinishRequest {
     pub identifier: String,
+    pub session_id: String,
     pub credential_finalization: Vec<u8>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OpaqueAuthFinishResponse {
     pub session_id: Uuid,
     pub session_key: Vec<u8>,
@@ -95,6 +175,35 @@ pub struct User {
     pub is_verified: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl User {
+    pub fn new(uuid: Uuid, identifier: &str, pepper: &str, user_type: UserType) -> Self {
+        let identifier_type = get_identifier_type(identifier);
+        let identifier_hash = hash_with_pepper(identifier, pepper);
+
+        let (username_hash, email_hash, phone_hash) = match identifier_type {
+            IdentifierType::Username => (Some(identifier_hash), None, None),
+            IdentifierType::Email => (None, Some(identifier_hash), None),
+            IdentifierType::Phone => (None, None, Some(identifier_hash)),
+        };
+
+        let now = chrono::Utc::now();
+
+        User {
+            uuid,
+            username_hash,
+            email_hash,
+            phone_hash,
+            seed_phrase_hash: None,
+            opaque_record: Vec::new(),
+            server_public_key: Vec::new(),
+            user_type,
+            is_verified: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +250,9 @@ pub enum ApiError {
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
+    #[error("Invalid user type")]
+    InvalidUserType,
+
     #[error("Internal server error: {0}")]
     InternalError(String),
 }
@@ -176,6 +288,7 @@ impl axum::response::IntoResponse for ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "Rate limit exceeded".to_string(),
             ),
+            ApiError::InvalidUserType => (StatusCode::BAD_REQUEST, "Invalid user type".to_string()),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 

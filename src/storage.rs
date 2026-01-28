@@ -1,15 +1,15 @@
-use crate::models::{ApiError, Session, User, UserType};
+use crate::models::{ApiError, Session, User};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::env;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct Database {
     pool: PgPool,
 }
 
 impl Database {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    pub async fn new(database_url: &String) -> Result<Self, Box<dyn std::error::Error>> {
 
         let pool = PgPoolOptions::new()
             .max_connections(10)
@@ -449,5 +449,11 @@ impl Database {
             self.find_user_by_hash(None, None, None, Some(&seed_hash))
                 .await
         }
+    }
+
+    pub fn is_configured() -> bool {
+        env::var("DATABASE_URL").is_ok()
+            && env::var("OPAQUE_SERVER_SETUP").is_ok()
+            && env::var("SERVER_PEPPER").is_ok()
     }
 }

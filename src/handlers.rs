@@ -1,7 +1,6 @@
 use axum::{Json, extract::State};
 use opaque_ke::{
-    CredentialFinalization, CredentialRequest, RegistrationRequest, RegistrationUpload,
-    ServerLogin, ServerRegistration,
+    ServerRegistration, ServerLogin, ServerLoginParameters,
 };
 use rand_core::OsRng;
 use uuid::Uuid;
@@ -13,15 +12,14 @@ use crate::{
         ApiError, OpaqueAuthFinishRequest, OpaqueAuthFinishResponse, OpaqueAuthStartRequest,
         OpaqueAuthStartResponse, OpaqueRegisterFinishRequest, OpaqueRegisterFinishResponse,
         OpaqueRegisterStartRequest, OpaqueRegisterStartResponse, Session, User, UserType,
-        hash_with_pepper,
+        hash_with_pepper, get_identifier_type, IdentifierType,
     },
 };
 
-// FIXME: тут надо сделать регистрацию, авторизацию и так далее
-
 // ============ OPAQUE РЕГИСТРАЦИЯ ============
 
-pub async fn register_start_handler(
+/// Начало процесса регистрации
+pub async fn register_start(
     State(state): State<AppState>,
     Json(payload): Json<OpaqueRegisterStartRequest>,
 ) -> Result<Json<OpaqueRegisterStartResponse>, ApiError> {
@@ -31,20 +29,20 @@ pub async fn register_start_handler(
     let identifier_hash = hash_with_pepper(identifier, &state.server_pepper);
 
     // Проверяем существование пользователя
-    let exists = match crate::models::get_identifier_type(identifier) {
-        crate::models::IdentifierType::Email => {
+    let exists = match get_identifier_type(identifier) {
+        IdentifierType::Email => {
             state
                 .db
                 .user_exists(None, Some(&identifier_hash), None)
                 .await?
         }
-        crate::models::IdentifierType::Phone => {
+        IdentifierType::Phone => {
             state
                 .db
                 .user_exists(None, None, Some(&identifier_hash))
                 .await?
         }
-        crate::models::IdentifierType::Username => {
+        IdentifierType::Username => {
             state
                 .db
                 .user_exists(Some(&identifier_hash), None, None)
@@ -56,94 +54,68 @@ pub async fn register_start_handler(
         return Err(ApiError::UserExists);
     }
 
-    let mut rng = OsRng;
+    // Десериализуем RegistrationRequest из payload
+    let client_reg_start = opaque_ke::RegistrationRequest::<DefaultCipherSuite>::deserialize(
+        &payload.registration_request,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to deserialize registration request: {:?}", e);
+        ApiError::BadRequest(format!("Invalid registration request: {}", e))
+    })?;
 
-    // Начинаем регистрацию
-    let (registration_request, server_registration) =
-        ServerRegistration::<DefaultCipherSuite>::start(
-            &mut rng,
-            &state.opaque_server_setup,
-            identifier.as_bytes(), // OPAQUE 4.x принимает bytes
-        )
-        .map_err(|e| {
-            tracing::error!("OPAQUE registration start failed: {:?}", e);
-            ApiError::OpaqueError(format!("Registration failed: {}", e))
-        })?;
-
-    // Сохраняем состояние регистрации
-    let registration_id = Uuid::new_v4().to_string();
-    state
-        .save_registration_state(&registration_id, server_registration)
-        .await?;
-
-    // Готовим ответ
-    let server_public_key = state
-        .opaque_server_setup
-        .get_public_key()
-        .serialize()
-        .to_vec();
+    // Начинаем регистрацию на сервере
+    let reg_start_result = ServerRegistration::<DefaultCipherSuite>::start(
+        &state.opaque_server_setup,
+        client_reg_start,
+        identifier.as_bytes(),
+    )
+    .map_err(|e| {
+        tracing::error!("OPAQUE registration start failed: {:?}", e);
+        ApiError::OpaqueError(format!("Registration failed: {}", e))
+    })?;
 
     Ok(Json(OpaqueRegisterStartResponse {
-        registration_id,
-        registration_request: registration_request.serialize().to_vec(),
-        server_public_key,
+        registration_request: reg_start_result.message.serialize().to_vec(),
+        server_public_key: vec![],
     }))
 }
 
-pub async fn register_finish_handler(
+/// Завершение процесса регистрации
+pub async fn register_finish(
     State(state): State<AppState>,
     Json(payload): Json<OpaqueRegisterFinishRequest>,
 ) -> Result<Json<OpaqueRegisterFinishResponse>, ApiError> {
-    // Получаем состояние регистрации
-    let server_registration = state
-        .get_registration_state(&payload.registration_id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::BadRequest("Registration session expired or not found".to_string())
-        })?;
+    // Десериализуем RegistrationUpload от клиента
+    let client_reg_upload = opaque_ke::RegistrationUpload::<DefaultCipherSuite>::deserialize(
+        &payload.registration_upload,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to deserialize registration upload: {:?}", e);
+        ApiError::BadRequest(format!("Invalid registration upload: {}", e))
+    })?;
 
-    // Десериализуем registration upload
-    let registration_upload =
-        RegistrationUpload::<DefaultCipherSuite>::deserialize(&payload.registration_upload)
-            .map_err(|e| {
-                tracing::error!("Failed to deserialize registration upload: {:?}", e);
-                ApiError::BadRequest(format!("Invalid registration upload: {}", e))
-            })?;
-
-    // Завершаем регистрацию
-    let (server_record, server_public_key) = server_registration
-        .finish(registration_upload)
-        .map_err(|e| {
-            tracing::error!("OPAQUE registration finish failed: {:?}", e);
-            ApiError::OpaqueError(format!("Registration finish failed: {}", e))
-        })?;
-
-    // Удаляем состояние регистрации
-    state
-        .remove_registration_state(&payload.registration_id)
-        .await?;
+    // Завершаем регистрацию и получаем password file (ServerRegistration)
+    let password_file = ServerRegistration::<DefaultCipherSuite>::finish(client_reg_upload);
 
     // Создаём пользователя
     let user_uuid = Uuid::new_v4();
     let identifier = payload.identifier.trim();
-    let identifier_hash = hash_with_pepper(identifier, &state.server_pepper);
+    let user_type = payload.user_type.clone().unwrap_or(UserType::Regular);
 
-    let mut user = User::new(
-        user_uuid,
-        identifier,
-        &state.server_pepper,
-        UserType::Regular,
-    );
+    let mut user = User::new(user_uuid, identifier, &state.server_pepper, user_type);
 
-    // Устанавливаем OPAQUE запись
-    user.opaque_record = server_record.serialize().to_vec();
-    user.server_public_key = server_public_key.serialize().to_vec();
+    // Устанавливаем OPAQUE запись (password file)
+    user.opaque_record = password_file.serialize().to_vec();
+    user.server_public_key = vec![];
 
-    // Сохраняем пользователя
-    state.db.save_user(&user).await.map_err(|e| {
-        tracing::error!("Failed to save user: {:?}", e);
-        ApiError::DatabaseError(e)
-    })?;
+    // Сохраняем пользователя в БД
+    state.db.save_user(&user).await
+        .map_err(|e| {
+            tracing::error!("Failed to save user: {:?}", e);
+            e
+        })?;
+
+    tracing::info!("User registered successfully: {}", user_uuid);
 
     Ok(Json(OpaqueRegisterFinishResponse {
         user_id: user_uuid,
@@ -153,49 +125,56 @@ pub async fn register_finish_handler(
 
 // ============ OPAQUE АУТЕНТИФИКАЦИЯ ============
 
-pub async fn login_start_handler(
+/// Начало процесса аутентификации
+pub async fn login_start(
     State(state): State<AppState>,
     Json(payload): Json<OpaqueAuthStartRequest>,
 ) -> Result<Json<OpaqueAuthStartResponse>, ApiError> {
     let identifier = payload.identifier.trim();
 
-    // Ищем пользователя
-    let identifier_hash = hash_with_pepper(identifier, &state.server_pepper);
+    // Ищем пользователя по идентификатору
     let user = state
         .db
-        .find_user_by_identifier(&identifier_hash)
+        .find_user_by_identifier(identifier, &state.server_pepper)
         .await?
-        .ok_or_else(|| ApiError::UserNotFound)?;
+        .ok_or_else(|| {
+            tracing::warn!("User not found during login: {}", identifier);
+            ApiError::UserNotFound
+        })?;
 
+    // Проверяем тип пользователя
     if user.user_type != UserType::Regular {
         return Err(ApiError::InvalidUserType);
     }
 
-    // Десериализуем OPAQUE запись
-    let server_record = opaque_ke::ServerRecord::<DefaultCipherSuite>::deserialize(
+    // Десериализуем password file пользователя
+    let password_file = ServerRegistration::<DefaultCipherSuite>::deserialize(
         &user.opaque_record,
     )
     .map_err(|e| {
-        tracing::error!("Failed to deserialize server record: {:?}", e);
-        ApiError::OpaqueError(format!("Invalid server record: {}", e))
+        tracing::error!("Failed to deserialize password file: {:?}", e);
+        ApiError::OpaqueError(format!("Invalid password file: {}", e))
+    })?;
+
+    // Десериализуем CredentialRequest от клиента
+    let client_login_start = opaque_ke::CredentialRequest::<DefaultCipherSuite>::deserialize(
+        &payload.credential_request,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to deserialize credential request: {:?}", e);
+        ApiError::BadRequest(format!("Invalid credential request: {}", e))
     })?;
 
     let mut rng = OsRng;
 
-    // Создаём credential request
-    let credential_request =
-        CredentialRequest::<DefaultCipherSuite>::new(&mut rng).map_err(|e| {
-            tracing::error!("Failed to create credential request: {:?}", e);
-            ApiError::OpaqueError(format!("Failed to create request: {}", e))
-        })?;
-
-    // Начинаем процесс логина
-    let server_login = ServerLogin::<DefaultCipherSuite>::start(
+    // Начинаем процесс логина на сервере
+    let login_start_result = ServerLogin::<DefaultCipherSuite>::start(
         &mut rng,
         &state.opaque_server_setup,
-        credential_request.clone(),
+        Some(password_file),
+        client_login_start,
         identifier.as_bytes(),
-        server_record,
+        ServerLoginParameters::default(),
     )
     .map_err(|e| {
         tracing::error!("OPAQUE login start failed: {:?}", e);
@@ -204,53 +183,60 @@ pub async fn login_start_handler(
 
     // Сохраняем состояние логина
     let session_id = Uuid::new_v4().to_string();
-    state.save_login_state(&session_id, server_login).await?;
-
-    let server_public_key = state
-        .opaque_server_setup
-        .get_public_key()
-        .serialize()
-        .to_vec();
+    let state_bytes = bincode::serialize(&login_start_result.state)
+        .map_err(|e| ApiError::InternalError(format!("Serialization failed: {}", e)))?;
+    state
+        .opaque_state
+        .save_login_state(&session_id, state_bytes)
+        .await;
 
     Ok(Json(OpaqueAuthStartResponse {
-        session_id,
-        credential_request: credential_request.serialize().to_vec(),
-        server_public_key,
+        credential_request: login_start_result.message.serialize().to_vec(),
+        server_public_key: vec![],
     }))
 }
 
-pub async fn login_finish_handler(
+/// Завершение процесса аутентификации
+pub async fn login_finish(
     State(state): State<AppState>,
     Json(payload): Json<OpaqueAuthFinishRequest>,
 ) -> Result<Json<OpaqueAuthFinishResponse>, ApiError> {
     // Получаем состояние логина
-    let server_login = state
+    let state_bytes = state
+        .opaque_state
         .get_login_state(&payload.session_id)
-        .await?
+        .await
         .ok_or_else(|| ApiError::BadRequest("Login session expired or not found".to_string()))?;
 
-    // Десериализуем credential finalization
-    let credential_finalization =
-        CredentialFinalization::<DefaultCipherSuite>::deserialize(&payload.credential_finalization)
-            .map_err(|e| {
-                tracing::error!("Failed to deserialize credential finalization: {:?}", e);
-                ApiError::BadRequest(format!("Invalid credential finalization: {}", e))
-            })?;
+    // Десериализуем ServerLogin state
+    let server_login_state: ServerLogin<DefaultCipherSuite> = bincode::deserialize(&state_bytes)
+        .map_err(|e| ApiError::InternalError(format!("Deserialization failed: {}", e)))?;
 
-    // Завершаем процесс логина
-    let session_key = server_login.finish(credential_finalization).map_err(|e| {
+    // Десериализуем CredentialFinalization от клиента
+    let client_login_finish = opaque_ke::CredentialFinalization::<DefaultCipherSuite>::deserialize(
+        &payload.credential_finalization,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to deserialize credential finalization: {:?}", e);
+        ApiError::BadRequest(format!("Invalid credential finalization: {}", e))
+    })?;
+
+    // Завершаем процесс логина и получаем session key
+    let finish_result = server_login_state.finish(
+        client_login_finish,
+        ServerLoginParameters::default(),
+    ).map_err(|e| {
         tracing::error!("OPAQUE login finish failed: {:?}", e);
         ApiError::InvalidCredentials
     })?;
 
     // Удаляем состояние логина
-    state.remove_login_state(&payload.session_id).await?;
+    state.opaque_state.remove_login_state(&payload.session_id).await;
 
     // Получаем пользователя для создания сессии
-    let identifier_hash = hash_with_pepper(&payload.identifier, &state.server_pepper);
     let user = state
         .db
-        .find_user_by_identifier(&identifier_hash)
+        .find_user_by_identifier(&payload.identifier, &state.server_pepper)
         .await?
         .ok_or_else(|| {
             tracing::error!("User not found after OPAQUE auth: {}", payload.identifier);
@@ -259,23 +245,49 @@ pub async fn login_finish_handler(
 
     // Создаём сессию
     let session_uuid = Uuid::new_v4();
-    let session_key_hash = blake3::hash(session_key.as_ref()).as_bytes().to_vec();
+    let session_key_hash = blake3::hash(&finish_result.session_key).as_bytes().to_vec();
 
     let session = Session {
         uuid: session_uuid,
         user_uuid: user.uuid,
         session_key_hash,
-        expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+        expires_at: chrono::Utc::now() + chrono::Duration::days(7),
         created_at: chrono::Utc::now(),
     };
 
-    state.db.save_session(&session).await.map_err(|e| {
-        tracing::error!("Failed to save session: {:?}", e);
-        ApiError::DatabaseError(e)
-    })?;
+    // Сохраняем сессию в БД
+    state.db.save_session(&session).await
+        .map_err(|e| {
+            tracing::error!("Failed to save session: {:?}", e);
+            e
+        })?;
+
+    tracing::info!("User authenticated successfully: {}", user.uuid);
 
     Ok(Json(OpaqueAuthFinishResponse {
         session_id: session_uuid,
-        session_key: session_key.as_ref().to_vec(),
+        session_key: finish_result.session_key.to_vec(),
     }))
+}
+
+// ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+
+/// Проверка и получение пользователя по сессии
+pub async fn verify_session(
+    state: &AppState,
+    session_id: &Uuid,
+) -> Result<(Session, User), ApiError> {
+    let session = state
+        .db
+        .get_session(session_id)
+        .await?
+        .ok_or(ApiError::SessionExpired)?;
+
+    let user = state
+        .db
+        .get_user_by_uuid(&session.user_uuid)
+        .await?
+        .ok_or(ApiError::UserNotFound)?;
+
+    Ok((session, user))
 }
